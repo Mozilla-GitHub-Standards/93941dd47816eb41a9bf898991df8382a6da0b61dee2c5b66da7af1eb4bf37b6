@@ -1,15 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"os"
-	"strings"
-	"time"
 
 	"github.com/mozilla-services/foxsec-pipeline-contrib/common"
 
@@ -26,24 +21,22 @@ import (
 
 var (
 	globalConfig Config
-	client       = &http.Client{
-		Timeout: 10 * time.Second,
-	}
-	KEYNAME = os.Getenv("KMS_KEYNAME")
+	KEYNAME      = os.Getenv("KMS_KEYNAME")
 )
 
 const (
-	ALERT_KIND     = "alert"
 	EMAIL_CHAR_SET = "UTF-8"
 )
 
 func init() {
-	mozlogrus.Enable("cloudtrail-streamer")
+	mozlogrus.Enable("foxsec-slack-bot")
 	InitConfig()
 }
 
 type Config struct {
 	slackSigningSecret string
+	slackAuthToken     string
+	slackClient        *slack.Client
 	escalationEmail    string
 	awsSecretAccessKey string
 	awsAccessKeyId     string
@@ -62,6 +55,13 @@ func InitConfig() error {
 	if err != nil {
 		log.Fatalf("Could not decrypt slack signing secret. Err: %s", err)
 	}
+
+	globalConfig.slackAuthToken, err = kms.DecryptSymmetric(KEYNAME, os.Getenv("SLACK_AUTH_TOKEN"))
+	if err != nil {
+		log.Fatalf("Could not decrypt slack auth token. Err: %s", err)
+	}
+
+	globalConfig.slackClient = slack.New(globalConfig.slackAuthToken)
 
 	globalConfig.escalationEmail = os.Getenv("ESCALATION_EMAIL")
 	if globalConfig.escalationEmail == "" {
@@ -138,98 +138,6 @@ func emailEscalation(alert *common.Alert) error {
 	return nil
 }
 
-type DBClient struct {
-	dsClient *datastore.Client
-}
-
-func (db *DBClient) alertKey(alertId string) *datastore.Key {
-	return datastore.NameKey(ALERT_KIND, alertId, nil)
-}
-
-func (db *DBClient) getAlert(alertId string) (*common.Alert, error) {
-	var alert common.Alert
-	err := db.dsClient.Get(context.TODO(), db.alertKey(alertId), &alert)
-	if err != nil {
-		log.Error(err)
-		return nil, err
-	}
-	return &alert, nil
-}
-
-func (db *DBClient) updateAlert(alert *common.Alert, status string) error {
-	tx, err := db.dsClient.NewTransaction(context.TODO())
-	if err != nil {
-		log.Errorf("updateAlert: %v", err)
-		return err
-	}
-
-	//TODO - handle case where there is no status
-	for _, am := range alert.Metadata {
-		if am.Key == "status" {
-			am.Value = status
-		}
-	}
-
-	if _, err := tx.Put(db.alertKey(alert.Id), alert); err != nil {
-		log.Errorf("updateAlert tx.Put: %v", err)
-		return err
-	}
-	if _, err := tx.Commit(); err != nil {
-		log.Errorf("updateAlert tx.Commit: %v", err)
-		return err
-	}
-	return nil
-}
-
-// Send email to pagerduty using AWS SES
-func (db *DBClient) escalateAlert(alert *common.Alert) error {
-	err := emailEscalation(alert)
-	if err != nil {
-		log.Error(err)
-		return err
-	}
-	err = db.updateAlert(alert, "ESCALATED")
-	if err != nil {
-		log.Error(err)
-		return err
-	}
-	return nil
-}
-
-func handleAuthConfirm(req slack.InteractionCallback, db *DBClient) (*slack.Msg, error) {
-	alertId := strings.Split(req.CallbackID, "_")[1]
-	alert, err := db.getAlert(alertId)
-	if err != nil {
-		log.Error(err)
-		return nil, err
-	}
-
-	response := "Error responding; please contact SecOps (secops@mozilla.com)"
-	if req.Actions[0].Name == "auth_yes" {
-		err := db.updateAlert(alert, "ACKNOWLEDGED")
-		if err != nil {
-			log.Error(err)
-		}
-		response = "Thank you for responding! Alert acknowledged"
-	} else if req.Actions[0].Name == "auth_no" {
-		err := db.escalateAlert(alert)
-		if err != nil {
-			log.Error(err)
-		}
-		response = "Thank you for responding! Alert has been escalated to SecOps (secops@mozilla.com)"
-	}
-
-	return &slack.Msg{Text: response, ReplaceOriginal: false}, nil
-}
-
-func isAuthConfirm(req slack.InteractionCallback) bool {
-	if strings.HasPrefix(req.CallbackID, "auth_confirmation") {
-		return true
-	}
-
-	return false
-}
-
 func FoxsecSlackHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
@@ -253,36 +161,33 @@ func FoxsecSlackHandler(w http.ResponseWriter, r *http.Request) {
 	defer dsClient.Close()
 	db := &DBClient{dsClient}
 
-	// Handle interaction callback
-	buf, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		log.Error(err.Error())
-		return
-	}
-	var req slack.InteractionCallback
-	err = json.Unmarshal(buf, &req)
-	if err != nil {
-		log.Error(err.Error())
-		return
-	}
+	if req, err := readInteraction(r); err == nil {
+		if isAuthConfirm(req) {
+			resp, err := handleAuthConfirm(req, db)
+			if err != nil {
+				log.Error(err.Error())
+				return
+			}
+			log.Info(resp)
 
-	if isAuthConfirm(req) {
-		resp, err := handleAuthConfirm(req, db)
-		if err != nil {
-			log.Error(err.Error())
-			return
+			err = sendSlackCallback(resp, req.ResponseURL)
+			if err != nil {
+				log.Error(err.Error())
+				return
+			}
 		}
-		log.Info(resp)
-
-		msg, err := json.Marshal(resp)
-		if err != nil {
-			log.Error(err.Error())
-			return
-		}
-		_, err = client.Post(req.ResponseURL, "application/json", bytes.NewBuffer(msg))
-		if err != nil {
-			log.Error(err.Error())
-			return
+	} else if cmd, err := slack.SlashCommandParse(r); err == nil {
+		if cmd.Command == WHITELIST_IP_SLASH_COMMAND {
+			resp, err := handleWhitelistCmd(cmd, db)
+			if err != nil {
+				log.Error(err.Error())
+				return
+			}
+			err = sendSlackCallback(resp, cmd.ResponseURL)
+			if err != nil {
+				log.Error(err.Error())
+				return
+			}
 		}
 	}
 
