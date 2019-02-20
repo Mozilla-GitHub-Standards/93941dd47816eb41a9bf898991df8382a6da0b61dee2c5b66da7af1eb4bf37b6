@@ -1,14 +1,12 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"os"
 
 	"github.com/mozilla-services/foxsec-pipeline-contrib/common"
 
-	"cloud.google.com/go/datastore"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -87,6 +85,21 @@ func InitConfig() error {
 	return nil
 }
 
+// Send email to pagerduty using AWS SES
+func escalateAlert(alert *common.Alert, db *common.DBClient) error {
+	err := emailEscalation(alert)
+	if err != nil {
+		log.Error(err)
+		return err
+	}
+	err = db.UpdateAlert(alert, "ESCALATED")
+	if err != nil {
+		log.Error(err)
+		return err
+	}
+	return nil
+}
+
 func emailEscalation(alert *common.Alert) error {
 	subject := fmt.Sprintf("[foxsec-pipeline-alert] Escalating alert - %s", alert.Summary)
 
@@ -153,13 +166,12 @@ func FoxsecSlackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dsClient, err := datastore.NewClient(context.TODO(), "")
+	db, err := common.NewDBClient()
 	if err != nil {
 		log.Error(err.Error())
 		return
 	}
-	defer dsClient.Close()
-	db := &DBClient{dsClient}
+	defer db.Close()
 
 	if req, err := readInteraction(r); err == nil {
 		if isAuthConfirm(req) {

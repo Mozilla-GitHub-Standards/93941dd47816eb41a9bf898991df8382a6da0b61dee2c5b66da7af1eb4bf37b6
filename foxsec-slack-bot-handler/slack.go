@@ -25,9 +25,9 @@ const (
 	WHITELIST_IP_SLASH_COMMAND = "whitelist_ip"
 )
 
-func handleAuthConfirm(req slack.InteractionCallback, db *DBClient) (*slack.Msg, error) {
+func handleAuthConfirm(req slack.InteractionCallback, db *common.DBClient) (*slack.Msg, error) {
 	alertId := strings.Split(req.CallbackID, "_")[1]
-	alert, err := db.getAlert(alertId)
+	alert, err := db.GetAlert(alertId)
 	if err != nil {
 		log.Error(err)
 		return nil, err
@@ -35,13 +35,13 @@ func handleAuthConfirm(req slack.InteractionCallback, db *DBClient) (*slack.Msg,
 
 	response := "Error responding; please contact SecOps (secops@mozilla.com)"
 	if req.Actions[0].Name == "auth_yes" {
-		err := db.updateAlert(alert, "ACKNOWLEDGED")
+		err := db.UpdateAlert(alert, "ACKNOWLEDGED")
 		if err != nil {
 			log.Error(err)
 		}
 		response = "Thank you for responding! Alert acknowledged"
 	} else if req.Actions[0].Name == "auth_no" {
-		err := db.escalateAlert(alert)
+		err := escalateAlert(alert, db)
 		if err != nil {
 			log.Error(err)
 		}
@@ -76,7 +76,7 @@ func isAuthConfirm(req slack.InteractionCallback) bool {
 	return false
 }
 
-func handleWhitelistCmd(cmd slack.SlashCommand, db *DBClient) (*slack.Msg, error) {
+func handleWhitelistCmd(cmd slack.SlashCommand, db *common.DBClient) (*slack.Msg, error) {
 	msg := &slack.Msg{}
 
 	splitCmd := strings.Split(cmd.Text, " ")
@@ -102,7 +102,7 @@ func handleWhitelistCmd(cmd slack.SlashCommand, db *DBClient) (*slack.Msg, error
 		return msg, err
 	}
 
-	err = db.saveWhitelistedIp(common.NewWhitelistedIP(ip.String(), expiresAt, userProfile.Email))
+	err = db.SaveWhitelistedIp(common.NewWhitelistedIP(ip.String(), expiresAt, userProfile.Email))
 	if err != nil {
 		log.Error(err.Error())
 		msg.Text = "Error saving IP to whitelist"
